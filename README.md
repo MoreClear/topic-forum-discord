@@ -9,6 +9,12 @@ Posts a message to a Discord channel whenever a new topic appears in the
 Atom feed, posts any topic whose ID is not yet in `state.json`, and commits
 the updated `state.json` back to the repository.
 
+Each message has a footer such as `Topic #155 · Joshua Becker's 4th`: the
+topic's number in the forum and among its author's topics, counted by publish
+time. The numbers come from the forum's public JSON export, which is fetched
+only when there is something new to post. If the export cannot be read, the
+topic is posted without the footer.
+
 Topics are matched by ID, not by date, because editing a topic moves it to the
 top of the feed.
 

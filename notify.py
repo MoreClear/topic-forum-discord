@@ -19,7 +19,8 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 FEED_URL = "https://topic.forum/api/forums/newspeak-house-2026-27/feed.atom"
-STATE_FILE = Path(__file__).parent / "state.json"
+EXPORT_URL = "https://topic.forum/api/forums/newspeak-house-2026-27/export"
+STATE_FILE =Path(__file__).parent / "state.json"
 USER_AGENT = "topic-forum-discord/1.0 (+https://topic.forum)"
 EXCERPT_LENGTH = 300
 EMBED_COLOUR = 0x5865F2
@@ -92,7 +93,39 @@ def parse_entries(xml_bytes):
     return entries
 
 
-def build_payload(entry):
+def ordinal(number):
+    if 10 <= number % 100 <= 20:
+        return f"{number}th"
+    return f"{number}{ {1: 'st', 2: 'nd', 3: 'rd'}.get(number % 10, 'th')}"
+
+
+def fetch_counts():
+    """Return {feed ID: footer text} giving each topic's place in the forum.
+
+    A topic's number is its position by publish time, in the forum and among
+    its author's topics. Returns {} if the export cannot be read, so that a
+    problem here never stops a topic being posted.
+    """
+    request = urllib.request.Request(EXPORT_URL, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            topics = json.loads(response.read())["topics"]
+        topics.sort(key=lambda t: t["publishedAt"])
+        counts = {}
+        per_host = {}
+        for number, topic in enumerate(topics, start=1):
+            host = topic["hostId"]
+            per_host[host] = per_host.get(host, 0) + 1
+            counts[f"urn:uuid:{topic['id']}"] = (
+                f"Topic #{number} · {topic['hostName']}'s {ordinal(per_host[host])}"
+            )
+        return counts
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(f"Could not read the export, posting without counts: {error}")
+        return {}
+
+
+def build_payload(entry, footer=None):
     embed = {
         "title": entry["title"][:256],
         "description": excerpt(entry["content"]),
@@ -104,6 +137,8 @@ def build_payload(entry):
         embed["author"] = {"name": entry["author"][:256]}
     if entry["published"]:
         embed["timestamp"] = entry["published"]
+    if footer:
+        embed["footer"] = {"text": footer[:2048]}
     # allowed_mentions stops topic text such as @everyone from pinging anyone.
     return {"embeds": [embed], "allowed_mentions": {"parse": []}}
 
@@ -154,8 +189,10 @@ def main():
     new_entries.sort(key=lambda e: e["published"] or "")
     print(f"{len(new_entries)} new topic(s)")
 
+    counts = fetch_counts() if new_entries else {}
+
     for entry in new_entries:
-        payload = build_payload(entry)
+        payload = build_payload(entry, counts.get(entry["id"]))
         if dry_run:
             print(json.dumps(payload, indent=2, ensure_ascii=False))
             continue
