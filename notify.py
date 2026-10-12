@@ -1,7 +1,8 @@
 """Post new topic.forum topics to a Discord channel via a webhook.
 
 Run on a schedule. Each run fetches the forum's Atom feed, posts any topic
-whose ID has not been seen before, and records it in state.json.
+whose ID has not been seen before, and records it in state.json. It then
+updates the heart count shown on the messages it has already posted.
 
 Environment variables:
   DISCORD_WEBHOOK_URL  the webhook to post to (required unless DRY_RUN is set)
@@ -99,30 +100,41 @@ def ordinal(number):
     return f"{number}{ {1: 'st', 2: 'nd', 3: 'rd'}.get(number % 10, 'th')}"
 
 
-def fetch_counts():
-    """Return {feed ID: footer text} giving each topic's place in the forum.
+def fetch_export():
+    """Return ({feed ID: footer text}, {feed ID: heart count}) from the export.
 
-    A topic's number is its position by publish time, in the forum and among
-    its author's topics. Returns {} if the export cannot be read, so that a
-    problem here never stops a topic being posted.
+    The footer gives a topic's number by publish time, in the forum and among
+    its author's topics. Returns ({}, {}) if the export cannot be read, so
+    that a problem here never stops a topic being posted.
     """
     request = urllib.request.Request(EXPORT_URL, headers={"User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
             topics = json.loads(response.read())["topics"]
         topics.sort(key=lambda t: t["publishedAt"])
-        counts = {}
+        footers = {}
+        hearts = {}
         per_host = {}
         for number, topic in enumerate(topics, start=1):
             host = topic["hostId"]
             per_host[host] = per_host.get(host, 0) + 1
-            counts[f"urn:uuid:{topic['id']}"] = (
+            feed_id = f"urn:uuid:{topic['id']}"
+            footers[feed_id] = (
                 f"Topic #{number} · {topic['hostName']}'s {ordinal(per_host[host])}"
             )
-        return counts
+            hearts[feed_id] = topic["heartCount"]
+        return footers, hearts
     except (OSError, ValueError, KeyError, TypeError) as error:
-        print(f"Could not read the export, posting without counts: {error}")
-        return {}
+        print(f"Could not read the export, carrying on without it: {error}")
+        return {}, {}
+
+
+def with_hearts(footer, hearts):
+    """Add the heart count to a footer. A topic with no hearts shows no count."""
+    parts = [footer] if footer else []
+    if hearts:
+        parts.append(f"❤️ {hearts}")
+    return " · ".join(parts) or None
 
 
 def build_payload(entry, footer=None):
@@ -143,20 +155,70 @@ def build_payload(entry, footer=None):
     return {"embeds": [embed], "allowed_mentions": {"parse": []}}
 
 
-def post_to_discord(webhook_url, payload):
-    body = json.dumps(payload).encode("utf-8")
+def discord_request(method, url, payload=None):
+    """Call the webhook and return its JSON reply, waiting out rate limits."""
+    body = None if payload is None else json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json", "User-Agent": USER_AGENT}
     for _ in range(5):
-        request = urllib.request.Request(webhook_url, data=body, headers=headers)
+        request = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=30):
-                return
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return json.loads(response.read())
         except urllib.error.HTTPError as error:
             if error.code != 429:
                 raise
             retry_after = json.loads(error.read()).get("retry_after", 5)
             time.sleep(float(retry_after) + 0.5)
     raise RuntimeError("Discord kept rate limiting the webhook")
+
+
+def post_to_discord(webhook_url, payload):
+    """Post a message and return its ID, which is needed to edit it later."""
+    return discord_request("POST", f"{webhook_url}?wait=true", payload)["id"]
+
+
+def update_hearts(webhook_url, state, hearts, dry_run):
+    """Edit each posted message whose topic's heart count has changed."""
+    for topic_id, message in list(state["messages"].items()):
+        count = hearts.get(topic_id)
+        if count is None or count == message["hearts"]:
+            continue
+        if dry_run:
+            print(f"Would update hearts {message['hearts']} -> {count}: {topic_id}")
+            continue
+        url = f"{webhook_url}/messages/{message['id']}"
+        try:
+            embeds = discord_request("GET", url)["embeds"]
+        except urllib.error.HTTPError as error:
+            if error.code != 404:
+                raise
+            embeds = []
+        if not embeds:
+            # The message was deleted, lost its embed, or is in a channel the
+            # webhook has since moved away from. Stop tracking it.
+            del state["messages"][topic_id]
+            save_state(state)
+            print(f"Stopped tracking {topic_id}: its message cannot be edited")
+            continue
+        # Send back only the fields this script sets, not Discord's extras.
+        old = embeds[0]
+        embed = {
+            key: old[key]
+            for key in ("title", "description", "url", "color", "timestamp")
+            if key in old
+        }
+        if "author" in old:
+            embed["author"] = {"name": old["author"]["name"]}
+        footer = with_hearts(message["footer"], count)
+        if footer:
+            embed["footer"] = {"text": footer[:2048]}
+        discord_request(
+            "PATCH", url, {"embeds": [embed], "allowed_mentions": {"parse": []}}
+        )
+        print(f"Updated hearts {message['hearts']} -> {count}: {old.get('title')}")
+        message["hearts"] = count
+        save_state(state)
+        time.sleep(1)
 
 
 def main():
@@ -169,18 +231,18 @@ def main():
     first_run = state is None
     if first_run:
         state = {"etag": None, "seen": []}
+    # Posted messages by topic ID, so their heart counts can be kept up to date.
+    state.setdefault("messages", {})
 
     xml_bytes, etag = fetch_feed(state["etag"])
     if xml_bytes is None:
         print("Feed unchanged")
-        return
-
-    entries = parse_entries(xml_bytes)
+    entries = parse_entries(xml_bytes) if xml_bytes else []
     seen = set(state["seen"])
 
     if first_run:
         # Record everything already on the forum so the channel is not flooded.
-        state = {"etag": etag, "seen": [e["id"] for e in entries]}
+        state = {"etag": etag, "seen": [e["id"] for e in entries], "messages": {}}
         save_state(state)
         print(f"First run: recorded {len(entries)} existing topics, posted nothing")
         return
@@ -189,19 +251,24 @@ def main():
     new_entries.sort(key=lambda e: e["published"] or "")
     print(f"{len(new_entries)} new topic(s)")
 
-    counts = fetch_counts() if new_entries else {}
+    footers, hearts = fetch_export() if new_entries or state["messages"] else ({}, {})
 
     for entry in new_entries:
-        payload = build_payload(entry, counts.get(entry["id"]))
+        footer = footers.get(entry["id"])
+        count = hearts.get(entry["id"], 0)
+        payload = build_payload(entry, with_hearts(footer, count))
         if dry_run:
             print(json.dumps(payload, indent=2, ensure_ascii=False))
             continue
-        post_to_discord(webhook_url, payload)
+        message_id = post_to_discord(webhook_url, payload)
         print(f"Posted: {entry['title']}")
         # Save after each post so a later failure does not cause a repost.
         state["seen"].append(entry["id"])
+        state["messages"][entry["id"]] = {"id": message_id, "footer": footer, "hearts": count}
         save_state(state)
         time.sleep(1)
+
+    update_hearts(webhook_url, state, hearts, dry_run)
 
     if not dry_run:
         # Only keep the ETag once every new topic has been posted.

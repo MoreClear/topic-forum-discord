@@ -11,9 +11,15 @@ the updated `state.json` back to the repository.
 
 Each message has a footer such as `Topic #155 · Joshua Becker's 4th`: the
 topic's number in the forum and among its author's topics, counted by publish
-time. The numbers come from the forum's public JSON export, which is fetched
-only when there is something new to post. If the export cannot be read, the
-topic is posted without the footer.
+time. The numbers come from the forum's public JSON export. If the export
+cannot be read, the topic is posted without the footer.
+
+The footer also shows the topic's hearts on the forum, such as `❤️ 7`, once it
+has at least one. `state.json` keeps the Discord message ID of each topic the
+bot posts, and every run reads the export and edits the messages whose count
+has changed. A count is therefore as old as the last run. A message that was
+deleted, or that sits in a channel the webhook has since left, cannot be
+edited and is dropped from tracking.
 
 Topics are matched by ID, not by date, because editing a topic moves it to the
 top of the feed.
