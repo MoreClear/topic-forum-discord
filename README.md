@@ -21,8 +21,17 @@ has changed. A count is therefore as old as the last run. A message that was
 deleted, or that sits in a channel the webhook has since left, cannot be
 edited and is dropped from tracking.
 
+A second footer line gives the topic's dates in UK time, such as
+`First published 25 Jul 2026 22:10 · Last edited 15 Oct 2026 01:21`. "Last
+edited" appears only for edits made after publishing, and is updated on the
+message along with the hearts. The forum keeps a topic's original publish date
+if it is hidden and later shown again, so such a topic can arrive with an old
+date and a low topic number.
+
 Topics are matched by ID, not by date, because editing a topic moves it to the
-top of the feed.
+top of the feed. The feed lists only the 50 most recently changed topics, so
+`state.json` records every topic in the export as seen, not only those in the
+feed. Otherwise editing an older topic would bring it into the feed as new.
 
 ## Setup
 

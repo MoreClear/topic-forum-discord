@@ -2,7 +2,8 @@
 
 Run on a schedule. Each run fetches the forum's Atom feed, posts any topic
 whose ID has not been seen before, and records it in state.json. It then
-updates the heart count shown on the messages it has already posted.
+updates the heart count and last-edited time shown on the messages it has
+already posted.
 
 Environment variables:
   DISCORD_WEBHOOK_URL  the webhook to post to (required unless DRY_RUN is set)
@@ -16,6 +17,7 @@ import time
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
+from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -26,6 +28,14 @@ USER_AGENT = "topic-forum-discord/1.0 (+https://topic.forum)"
 EXCERPT_LENGTH = 300
 EMBED_COLOUR = 0x5865F2
 ATOM = {"a": "http://www.w3.org/2005/Atom"}
+
+try:
+    from zoneinfo import ZoneInfo
+
+    LONDON = ZoneInfo("Europe/London")
+except Exception:
+    # Windows has no time zone data unless the tzdata package is installed.
+    LONDON = None
 
 
 class TextExtractor(HTMLParser):
@@ -101,40 +111,65 @@ def ordinal(number):
 
 
 def fetch_export():
-    """Return ({feed ID: footer text}, {feed ID: heart count}) from the export.
+    """Return {feed ID: details} for every published topic in the export.
 
-    The footer gives a topic's number by publish time, in the forum and among
-    its author's topics. Returns ({}, {}) if the export cannot be read, so
-    that a problem here never stops a topic being posted.
+    Each topic's details are "footer" (its number by publish time, in the
+    forum and among its author's topics), "hearts", "published" and "edited"
+    (the last content edit after publishing, or None). Returns {} if the
+    export cannot be read, so that a problem here never stops a topic being
+    posted.
     """
     request = urllib.request.Request(EXPORT_URL, headers={"User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
             topics = json.loads(response.read())["topics"]
         topics.sort(key=lambda t: t["publishedAt"])
-        footers = {}
-        hearts = {}
+        details = {}
         per_host = {}
         for number, topic in enumerate(topics, start=1):
             host = topic["hostId"]
             per_host[host] = per_host.get(host, 0) + 1
-            feed_id = f"urn:uuid:{topic['id']}"
-            footers[feed_id] = (
-                f"Topic #{number} · {topic['hostName']}'s {ordinal(per_host[host])}"
-            )
-            hearts[feed_id] = topic["heartCount"]
-        return footers, hearts
+            published = topic["publishedAt"]
+            edited = topic.get("contentUpdatedAt")
+            # Edits made while the topic was still a draft do not count.
+            if not edited or edited <= published:
+                edited = None
+            details[f"urn:uuid:{topic['id']}"] = {
+                "footer": f"Topic #{number} · {topic['hostName']}'s {ordinal(per_host[host])}",
+                "hearts": topic["heartCount"],
+                "published": published,
+                "edited": edited,
+            }
+        return details
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(f"Could not read the export, carrying on without it: {error}")
-        return {}, {}
+        return {}
 
 
-def with_hearts(footer, hearts):
-    """Add the heart count to a footer. A topic with no hearts shows no count."""
-    parts = [footer] if footer else []
+def format_time(timestamp):
+    """Turn an ISO timestamp into UK time, such as "25 Jul 2026 22:10"."""
+    moment = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    if LONDON is None:
+        return moment.strftime("%d %b %Y %H:%M UTC").lstrip("0")
+    return moment.astimezone(LONDON).strftime("%d %b %Y %H:%M").lstrip("0")
+
+
+def build_footer(footer, hearts, published=None, edited=None):
+    """Join the footer's parts. A topic with no hearts shows no count.
+
+    The dates go on a second line: when the topic was first published and,
+    if it has been edited since, when it was last edited.
+    """
+    first = [footer] if footer else []
     if hearts:
-        parts.append(f"❤️ {hearts}")
-    return " · ".join(parts) or None
+        first.append(f"❤️ {hearts}")
+    second = []
+    if published:
+        second.append(f"First published {format_time(published)}")
+    if edited:
+        second.append(f"Last edited {format_time(edited)}")
+    lines = [" · ".join(part) for part in (first, second) if part]
+    return "\n".join(lines) or None
 
 
 def build_payload(entry, footer=None):
@@ -147,8 +182,6 @@ def build_payload(entry, footer=None):
         embed["url"] = entry["url"]
     if entry["author"]:
         embed["author"] = {"name": entry["author"][:256]}
-    if entry["published"]:
-        embed["timestamp"] = entry["published"]
     if footer:
         embed["footer"] = {"text": footer[:2048]}
     # allowed_mentions stops topic text such as @everyone from pinging anyone.
@@ -177,14 +210,22 @@ def post_to_discord(webhook_url, payload):
     return discord_request("POST", f"{webhook_url}?wait=true", payload)["id"]
 
 
-def update_hearts(webhook_url, state, hearts, dry_run):
-    """Edit each posted message whose topic's heart count has changed."""
+def update_messages(webhook_url, state, details, dry_run):
+    """Edit each posted message whose topic's hearts or last edit have changed."""
     for topic_id, message in list(state["messages"].items()):
-        count = hearts.get(topic_id)
-        if count is None or count == message["hearts"]:
+        topic = details.get(topic_id)
+        if topic is None:
             continue
+        # Messages posted before the dates were added have no "published".
+        if (
+            topic["hearts"] == message["hearts"]
+            and topic["edited"] == message.get("edited")
+            and "published" in message
+        ):
+            continue
+        change = f"hearts {message['hearts']} -> {topic['hearts']}, edited {topic['edited']}"
         if dry_run:
-            print(f"Would update hearts {message['hearts']} -> {count}: {topic_id}")
+            print(f"Would update {change}: {topic_id}")
             continue
         url = f"{webhook_url}/messages/{message['id']}"
         try:
@@ -202,21 +243,26 @@ def update_hearts(webhook_url, state, hearts, dry_run):
             continue
         # Send back only the fields this script sets, not Discord's extras.
         old = embeds[0]
+        # The timestamp is left out because the footer now gives the dates.
         embed = {
             key: old[key]
-            for key in ("title", "description", "url", "color", "timestamp")
+            for key in ("title", "description", "url", "color")
             if key in old
         }
         if "author" in old:
             embed["author"] = {"name": old["author"]["name"]}
-        footer = with_hearts(message["footer"], count)
+        footer = build_footer(
+            message["footer"], topic["hearts"], topic["published"], topic["edited"]
+        )
         if footer:
             embed["footer"] = {"text": footer[:2048]}
         discord_request(
             "PATCH", url, {"embeds": [embed], "allowed_mentions": {"parse": []}}
         )
-        print(f"Updated hearts {message['hearts']} -> {count}: {old.get('title')}")
-        message["hearts"] = count
+        print(f"Updated {change}: {old.get('title')}")
+        message["hearts"] = topic["hearts"]
+        message["published"] = topic["published"]
+        message["edited"] = topic["edited"]
         save_state(state)
         time.sleep(1)
 
@@ -242,7 +288,11 @@ def main():
 
     if first_run:
         # Record everything already on the forum so the channel is not flooded.
-        state = {"etag": etag, "seen": [e["id"] for e in entries], "messages": {}}
+        # The feed lists only the 50 most recently changed topics, so the
+        # export is needed too; otherwise editing an older topic would bring
+        # it into the feed and it would be posted as new.
+        known = {e["id"] for e in entries} | set(fetch_export())
+        state = {"etag": etag, "seen": sorted(known), "messages": {}}
         save_state(state)
         print(f"First run: recorded {len(entries)} existing topics, posted nothing")
         return
@@ -251,12 +301,15 @@ def main():
     new_entries.sort(key=lambda e: e["published"] or "")
     print(f"{len(new_entries)} new topic(s)")
 
-    footers, hearts = fetch_export() if new_entries or state["messages"] else ({}, {})
+    details = fetch_export() if new_entries or state["messages"] else {}
 
     for entry in new_entries:
-        footer = footers.get(entry["id"])
-        count = hearts.get(entry["id"], 0)
-        payload = build_payload(entry, with_hearts(footer, count))
+        topic = details.get(entry["id"], {})
+        footer = topic.get("footer")
+        count = topic.get("hearts", 0)
+        published = topic.get("published") or entry["published"]
+        edited = topic.get("edited")
+        payload = build_payload(entry, build_footer(footer, count, published, edited))
         if dry_run:
             print(json.dumps(payload, indent=2, ensure_ascii=False))
             continue
@@ -264,11 +317,17 @@ def main():
         print(f"Posted: {entry['title']}")
         # Save after each post so a later failure does not cause a repost.
         state["seen"].append(entry["id"])
-        state["messages"][entry["id"]] = {"id": message_id, "footer": footer, "hearts": count}
+        state["messages"][entry["id"]] = {
+            "id": message_id,
+            "footer": footer,
+            "hearts": count,
+            "published": published,
+            "edited": edited,
+        }
         save_state(state)
         time.sleep(1)
 
-    update_hearts(webhook_url, state, hearts, dry_run)
+    update_messages(webhook_url, state, details, dry_run)
 
     if not dry_run:
         # Only keep the ETag once every new topic has been posted.
