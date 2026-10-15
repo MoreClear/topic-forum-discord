@@ -162,17 +162,23 @@
     "urn:uuid:9a9fb396-11a1-4abb-9f80-aa2463f08f3a": {
       "id": "1558938303095509035",
       "footer": "Topic #154 \u00b7 Joshua Becker's 11th",
-      "hearts": 1
+      "hearts": 1,
+      "published": "2026-10-01T19:01:56.229Z",
+      "edited": null
     },
     "urn:uuid:f89a67cb-83d8-4b71-9929-e1320205997d": {
       "id": "1558938308480864280",
       "footer": "Topic #155 \u00b7 Andreas Varotsis's 8th",
-      "hearts": 1
+      "hearts": 1,
+      "published": "2026-10-11T16:48:31.176Z",
+      "edited": null
     },
     "urn:uuid:3886efc1-cfe3-419f-85a0-f5a6c22a5215": {
       "id": "1560050594285097062",
       "footer": "Topic #43 \u00b7 Zarinah Agnew's 1st",
-      "hearts": 0
+      "hearts": 0,
+      "published": "2026-07-25T21:10:19.116Z",
+      "edited": "2026-10-15T00:21:52.557Z"
     }
   }
 }
